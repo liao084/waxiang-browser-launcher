@@ -603,7 +603,8 @@ def precheck_sycm_login(
             store_name=settings.store_name,
             child_pid=cdp_info.pid,
         )
-        page.get_by_role("button", name="登录", exact=True).click()
+        login_frame = page.frame_locator("iframe#alibaba-login-box")
+        login_frame.get_by_role("button", name="登录", exact=True).click()
         page.wait_for_url(
             SYCM_LOGIN_SUCCESS_URL,
             wait_until="domcontentloaded",
