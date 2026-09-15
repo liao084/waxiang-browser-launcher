@@ -16,12 +16,18 @@ from typing import Any
 
 import psutil
 from dotenv import load_dotenv
-from playwright.sync_api import Browser, Page, expect, sync_playwright
+from playwright.sync_api import Browser, CDPSession, Page, expect, sync_playwright
 
 
 LOG_FILE_NAME = "browser_launcher.log"
 STATUS_FILE_NAME = "status.json"
-CHILD_BROWSER_TEST_URL = "https://www.baidu.com/"
+SYCM_LOGIN_URL = (
+    "https://sycm.taobao.com/custom/login.htm?"
+    "_target=http://sycm.taobao.com/portal/home.htm"
+)
+SYCM_LOGIN_SUCCESS_URL = "https://sycm.taobao.com/portal/home.htm"
+SYCM_LOGIN_BUFFER_MS = 3_000
+SYCM_LOGIN_TIMEOUT_MS = 45_000
 POLL_INTERVAL_SECONDS = 1.0
 LOG_MAX_BYTES = 5_000 * 1024
 LOG_BACKUP_COUNT = 1
@@ -510,12 +516,48 @@ def launch_store_browser_via_manager_center(
     return baseline_process_ids
 
 
-def verify_child_browser_control(
+def configure_sycm_network_conditions(
+    cdp_session: CDPSession,
+    chrome_version: str,
+) -> None:
+    """禁用页面 HTTP 缓存，并启用 DevTools 的 Chrome — Windows UA 预设。"""
+
+    major_version = chrome_version.split(".", 1)[0]
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
+    )
+    cdp_session.send("Network.enable")
+    cdp_session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+    # Use browser default 没有独立开关；显式设置预设 UA 和 Client Hints 即启用覆盖。
+    cdp_session.send(
+        "Network.setUserAgentOverride",
+        {
+            "userAgent": user_agent,
+            "userAgentMetadata": {
+                "brands": [
+                    {"brand": "Not A;Brand", "version": "99"},
+                    {"brand": "Chromium", "version": major_version},
+                    {"brand": "Google Chrome", "version": major_version},
+                ],
+                "fullVersion": chrome_version,
+                "platform": "Windows",
+                "platformVersion": "10.0",
+                "architecture": "x86",
+                "model": "",
+                "mobile": False,
+            },
+        },
+    )
+    LOGGER.info("SYCM 页面网络条件已设置：禁用缓存，UA 预设=Chrome — Windows")
+
+
+def precheck_sycm_login(
     child_browser: Browser,
     settings: Settings,
     cdp_info: ChildBrowserCdpInfo,
 ) -> None:
-    """在已连接的子浏览器 Context 中新建页面并验证 Playwright 控制。"""
+    """在子浏览器原有 Context 中尝试 SYCM 登录，暂不校验自动填充或处理滑块。"""
 
     if len(child_browser.contexts) != 1:
         raise RuntimeError(
@@ -529,24 +571,52 @@ def verify_child_browser_control(
 
     write_status(
         "RUNNING",
-        "VERIFYING_CHILD_BROWSER",
-        "正在通过子浏览器打开验证页面",
+        "OPENING_SYCM_LOGIN",
+        "正在通过子浏览器打开 SYCM 登录页",
         store_name=settings.store_name,
         child_pid=cdp_info.pid,
         cdp_port=cdp_info.port,
     )
     page = child_context.new_page()
     page.goto(
-        CHILD_BROWSER_TEST_URL,
+        SYCM_LOGIN_URL,
         wait_until="domcontentloaded",
         timeout=settings.action_timeout,
     )
-    LOGGER.info("子浏览器验证成功，当前页面：%s", page.url)
+    page.wait_for_timeout(SYCM_LOGIN_BUFFER_MS)
+
+    cdp_session = child_context.new_cdp_session(page)
+    try:
+        write_status(
+            "RUNNING",
+            "CONFIGURING_SYCM_NETWORK",
+            "正在设置 SYCM 页面网络条件",
+            store_name=settings.store_name,
+            child_pid=cdp_info.pid,
+        )
+        configure_sycm_network_conditions(cdp_session, child_browser.version)
+
+        write_status(
+            "RUNNING",
+            "LOGGING_IN_SYCM",
+            "正在点击登录并等待 SYCM 首页",
+            store_name=settings.store_name,
+            child_pid=cdp_info.pid,
+        )
+        page.get_by_role("button", name="登录", exact=True).click()
+        page.wait_for_url(
+            SYCM_LOGIN_SUCCESS_URL,
+            wait_until="domcontentloaded",
+            timeout=SYCM_LOGIN_TIMEOUT_MS,
+        )
+        LOGGER.info("SYCM 登录预检成功，当前页面：%s", page.url)
+    finally:
+        cdp_session.detach()
 
     write_status(
         "SUCCESS",
-        "CHILD_BROWSER_VERIFIED",
-        "店铺子浏览器已启动并完成页面验证",
+        "SYCM_LOGIN_SUCCESS",
+        "店铺子浏览器已启动并完成 SYCM 登录预检",
         store_name=settings.store_name,
         child_pid=cdp_info.pid,
         user_data_dir=str(cdp_info.user_data_dir),
@@ -557,7 +627,7 @@ def verify_child_browser_control(
 
 
 def run_browser_flow(settings: Settings) -> None:
-    """串联管理中心启动、子进程发现、CDP 连接和页面验证流程。"""
+    """串联管理中心启动、子进程发现、CDP 连接和 SYCM 登录预检流程。"""
 
     with sync_playwright() as playwright:
         manager_browser = playwright.chromium.connect_over_cdp(
@@ -608,7 +678,7 @@ def run_browser_flow(settings: Settings) -> None:
             timeout=settings.action_timeout,
         )
         LOGGER.info("Playwright 已连接子浏览器 CDP：PID=%d", child_cdp.pid)
-        verify_child_browser_control(child_browser, settings, child_cdp)
+        precheck_sycm_login(child_browser, settings, child_cdp)
 
         LOGGER.info("启动器流程执行完成；不会主动关闭管理中心或子浏览器")
 
