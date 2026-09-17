@@ -20,11 +20,16 @@ from playwright.async_api import (
     Browser,
     CDPSession,
     Error as PlaywrightError,
-    FrameLocator,
     Locator,
     Page,
     async_playwright,
     expect,
+)
+
+from slider_motion import (
+    calculate_slider_drag_distance,
+    drag_mouse_along_trajectory,
+    generate_drag_trajectory,
 )
 
 
@@ -685,10 +690,46 @@ async def click_login_and_wait_for_outcome(
         await asyncio.gather(*pending, return_exceptions=True)
 
 
-async def handle_sycm_slider(login_frame: FrameLocator) -> None:
-    """处理 SYCM 登录滑块；具体轨迹逻辑将在后续实现。"""
+async def handle_sycm_slider(
+    page: Page,
+    slider_button: Locator,
+    sliding_region: Locator,
+    timeout_ms: int,
+) -> None:
+    """读取 SYCM 滑块 CSS 尺寸，并使用拟人轨迹拖动到右侧。"""
 
-    pass
+    await expect(slider_button).to_be_visible(timeout=timeout_ms)
+    await expect(sliding_region).to_be_visible(timeout=timeout_ms)
+    slider_box = await slider_button.bounding_box()
+    sliding_region_box = await sliding_region.bounding_box()
+    if slider_box is None:
+        raise RuntimeError("无法取得 SYCM 滑块按钮的 CSS 边界")
+    if sliding_region_box is None:
+        raise RuntimeError("无法取得 SYCM 滑动区域的 CSS 边界")
+
+    distance_x = calculate_slider_drag_distance(
+        sliding_region_width=sliding_region_box["width"],
+        slider_width=slider_box["width"],
+    )
+    start_x = slider_box["x"] + slider_box["width"] / 2
+    start_y = slider_box["y"] + slider_box["height"] / 2
+    trajectory = generate_drag_trajectory(distance_x)
+    LOGGER.info(
+        "正在拖动 SYCM 滑块：region_width=%.2f，slider_width=%.2f，"
+        "distance=%.2f，points=%d，duration=%.3fs",
+        sliding_region_box["width"],
+        slider_box["width"],
+        distance_x,
+        len(trajectory),
+        trajectory[-1].elapsed_seconds,
+    )
+    await drag_mouse_along_trajectory(
+        page,
+        start_x,
+        start_y,
+        trajectory,
+    )
+    LOGGER.info("SYCM 滑块拖动已完成")
 
 
 async def precheck_sycm_login(
@@ -696,7 +737,7 @@ async def precheck_sycm_login(
     settings: Settings,
     cdp_info: ChildBrowserCdpInfo,
 ) -> None:
-    """等待 SYCM 账号密码自动填充后尝试登录，暂不处理滑块。"""
+    """等待 SYCM 账号密码自动填充，并完成登录与简单滑块预检。"""
 
     if len(child_browser.contexts) != 1:
         raise RuntimeError(
@@ -729,6 +770,7 @@ async def precheck_sycm_login(
     )
     login_button = login_frame.get_by_role("button", name="登录", exact=True)
     slider_button = login_frame.get_by_role("button", name="滑块", exact=True)
+    sliding_region = login_frame.locator("span.nc-lang-cnt")
     LOGGER.info("正在等待 SYCM 账号密码自动填充：%s", settings.store_name)
     await expect(password_input).not_to_have_value(
         "",
@@ -767,8 +809,30 @@ async def precheck_sycm_login(
                     return
                 case LoginOutcome.SLIDER_REQUIRED:
                     LOGGER.info("检测到 SYCM 登录滑块：%s", settings.store_name)
-                    await handle_sycm_slider(login_frame)
-                    raise NotImplementedError("SYCM 登录滑块处理尚未实现")
+                    await handle_sycm_slider(
+                        page,
+                        slider_button,
+                        sliding_region,
+                        settings.action_timeout,
+                    )
+                    LOGGER.info(
+                        "SYCM 滑块拖动完成，正在重新点击登录：%s",
+                        settings.store_name,
+                    )
+                    await login_button.click()
+                    await page.wait_for_url(
+                        SYCM_LOGIN_SUCCESS_URL,
+                        wait_until="domcontentloaded",
+                        timeout=SYCM_LOGIN_TIMEOUT_MS,
+                    )
+                    LOGGER.info(
+                        "SYCM 滑块验证及登录预检成功：店铺=%s，"
+                        "PID=%d，当前页面=%s",
+                        settings.store_name,
+                        cdp_info.pid,
+                        page.url,
+                    )
+                    return
                 case LoginOutcome.RETRY_REQUIRED if attempt == 1:
                     LOGGER.warning(
                         "SYCM 登录点击后未出现结果，准备重试：%s",
