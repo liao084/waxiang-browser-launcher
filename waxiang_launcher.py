@@ -1,36 +1,51 @@
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import json
 import logging
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from enum import Enum, auto
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 import psutil
 from dotenv import load_dotenv
-from playwright.sync_api import Browser, CDPSession, Page, expect, sync_playwright
+from playwright.async_api import (
+    Browser,
+    CDPSession,
+    Error as PlaywrightError,
+    FrameLocator,
+    Locator,
+    Page,
+    async_playwright,
+    expect,
+)
 
 
 LOG_FILE_NAME = "browser_launcher.log"
-STATUS_FILE_NAME = "status.json"
 SYCM_LOGIN_URL = (
     "https://sycm.taobao.com/custom/login.htm?"
     "_target=http://sycm.taobao.com/portal/home.htm"
 )
 SYCM_LOGIN_SUCCESS_URL = "https://sycm.taobao.com/portal/home.htm"
-SYCM_LOGIN_BUFFER_MS = 3_000
 SYCM_LOGIN_TIMEOUT_MS = 45_000
 POLL_INTERVAL_SECONDS = 1.0
 LOG_MAX_BYTES = 5_000 * 1024
 LOG_BACKUP_COUNT = 1
+
+
+class LoginOutcome(Enum):
+    """表示点击登录后最先确认的业务结果。"""
+
+    SUCCESS = auto()
+    SLIDER_REQUIRED = auto()
+    RETRY_REQUIRED = auto()
 
 
 def application_dir() -> Path:
@@ -43,7 +58,6 @@ def application_dir() -> Path:
 
 APP_DIR = application_dir()
 LOG_PATH = APP_DIR / LOG_FILE_NAME
-STATUS_PATH = APP_DIR / STATUS_FILE_NAME
 
 
 def configure_logging() -> logging.Logger:
@@ -74,30 +88,6 @@ def configure_logging() -> logging.Logger:
 
 
 LOGGER = configure_logging()
-
-
-def write_status(
-    state: str,
-    step: str,
-    message: str,
-    **extra: Any,
-) -> None:
-    """以原子替换方式写入供易语言读取的最新流程状态。"""
-
-    payload = {
-        "state": state,
-        "step": step,
-        "message": message,
-        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        **extra,
-    }
-    temporary_path = STATUS_PATH.with_suffix(STATUS_PATH.suffix + ".tmp")
-    with temporary_path.open("w", encoding="utf-8", newline="\n") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
-        file.write("\n")
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temporary_path, STATUS_PATH)
 
 
 @dataclass(frozen=True)
@@ -181,12 +171,21 @@ def load_settings() -> Settings:
     if action_timeout <= 0:
         raise ValueError("action_timeout 必须大于 0")
 
-    return Settings(
+    settings = Settings(
         manager_link_path=Path(required_env("manager_link_path")),
         cdp_port=cdp_port,
         store_name=required_env("store_name"),
         action_timeout=action_timeout,
     )
+    LOGGER.info(
+        "配置加载完成：manager_link_path=%s，cdp_port=%d，"
+        "store_name=%s，action_timeout=%d",
+        settings.manager_link_path,
+        settings.cdp_port,
+        settings.store_name,
+        settings.action_timeout,
+    )
+    return settings
 
 
 def shell_execute_manager(settings: Settings) -> None:
@@ -199,6 +198,7 @@ def shell_execute_manager(settings: Settings) -> None:
             f"挖象管理中心快捷方式不存在：{settings.manager_link_path}"
         )
 
+    LOGGER.info("正在通过 ShellExecute 启动挖象管理中心")
     shell_execute = ctypes.windll.shell32.ShellExecuteW  # type: ignore[attr-defined]
     shell_execute.argtypes = [
         ctypes.c_void_p,
@@ -235,7 +235,7 @@ def fetch_json(url: str, timeout_seconds: float = 1) -> dict[str, Any]:
     return result
 
 
-def wait_for_cdp_http(
+async def wait_for_cdp_http(
     cdp_http_url: str,
     timeout_ms: int,
     browser_name: str,
@@ -243,12 +243,14 @@ def wait_for_cdp_http(
     """轮询 CDP 的 /json/version，直到指定浏览器可以接受连接。"""
 
     version_url = f"{cdp_http_url}/json/version"
-    deadline = time.monotonic() + timeout_ms / 1000
+    LOGGER.info("正在等待%s CDP：%s", browser_name, cdp_http_url)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
     last_error: Exception | None = None
 
-    while time.monotonic() < deadline:
+    while loop.time() < deadline:
         try:
-            result = fetch_json(version_url)
+            result = await asyncio.to_thread(fetch_json, version_url)
             LOGGER.info("%s CDP 已就绪：%s", browser_name, cdp_http_url)
             return result
         except (
@@ -259,7 +261,7 @@ def wait_for_cdp_http(
             ValueError,
         ) as error:
             last_error = error
-            time.sleep(POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise TimeoutError(
         f"在 {timeout_ms}ms 内未检测到{browser_name} CDP："
@@ -289,7 +291,7 @@ def snapshot_process_ids() -> set[int]:
     return {process.pid for process in psutil.process_iter(["pid"])}
 
 
-def wait_for_child_browser_process(
+async def wait_for_child_browser_process(
     store_name: str,
     baseline_process_ids: set[int],
     timeout_ms: int,
@@ -299,11 +301,13 @@ def wait_for_child_browser_process(
     if os.name != "nt":
         raise RuntimeError("子浏览器进程识别仅支持 Windows")
 
-    deadline = time.monotonic() + timeout_ms / 1000
+    LOGGER.info("正在查找店铺 %s 的子浏览器进程", store_name)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
     attributes = ["pid", "ppid", "name", "exe", "cmdline"]
     last_candidates: list[dict[str, Any]] = []
 
-    while time.monotonic() < deadline:
+    while loop.time() < deadline:
         matches: list[ChildBrowserProcessInfo] = []
         candidates: list[dict[str, Any]] = []
 
@@ -377,7 +381,7 @@ def wait_for_child_browser_process(
             )
 
         last_candidates = candidates
-        time.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise TimeoutError(
         f"在 {timeout_ms}ms 内未找到店铺 {store_name} 的子浏览器根进程；"
@@ -386,17 +390,23 @@ def wait_for_child_browser_process(
     )
 
 
-def wait_for_child_browser_cdp(
+async def wait_for_child_browser_cdp(
     child_process: ChildBrowserProcessInfo,
     timeout_ms: int,
 ) -> ChildBrowserCdpInfo:
     """读取子浏览器 DevToolsActivePort，并等待动态 CDP 端口就绪。"""
 
     devtools_active_port = child_process.user_data_dir / "DevToolsActivePort"
-    deadline = time.monotonic() + timeout_ms / 1000
+    LOGGER.info(
+        "正在读取子浏览器 CDP 信息：PID=%d，路径=%s",
+        child_process.pid,
+        devtools_active_port,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
     last_error: Exception | None = None
 
-    while time.monotonic() < deadline:
+    while loop.time() < deadline:
         try:
             content = devtools_active_port.read_text(encoding="utf-8-sig")
             lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -421,7 +431,10 @@ def wait_for_child_browser_cdp(
                 websocket_url=websocket_url,
             )
 
-            fetch_json(f"{cdp_info.http_url}/json/version")
+            await asyncio.to_thread(
+                fetch_json,
+                f"{cdp_info.http_url}/json/version",
+            )
             LOGGER.info(
                 "已取得子浏览器 CDP：PID=%d，port=%d，websocket_url=%s",
                 cdp_info.pid,
@@ -437,7 +450,7 @@ def wait_for_child_browser_cdp(
             ValueError,
         ) as error:
             last_error = error
-            time.sleep(POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise TimeoutError(
         f"在 {timeout_ms}ms 内未取得子浏览器 CDP 信息："
@@ -456,7 +469,7 @@ def get_only_page(browser: Browser) -> Page:
     return pages[0]
 
 
-def launch_store_browser_via_manager_center(
+async def launch_store_browser_via_manager_center(
     browser: Browser,
     settings: Settings,
 ) -> set[int]:
@@ -465,50 +478,43 @@ def launch_store_browser_via_manager_center(
     page = get_only_page(browser)
     page.set_default_timeout(settings.action_timeout)
     page.set_default_navigation_timeout(settings.action_timeout)
-    page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded")
 
-    write_status("RUNNING", "OPENING_ACCOUNTS", "正在进入账号页面")
+    LOGGER.info("正在进入挖象管理中心账号页面")
     account_menu = page.locator('div.menu_bar:has-text("账号")')
-    expect(account_menu).to_have_count(1, timeout=settings.action_timeout)
-    account_menu.click()
+    await expect(account_menu).to_have_count(1, timeout=settings.action_timeout)
+    await account_menu.click()
 
     search_box = page.get_by_role("textbox", name="搜索名称", exact=False)
-    search_box.wait_for(state="visible")
+    await search_box.wait_for(state="visible")
 
     rows = page.locator("table.el-table__body")
-    write_status("RUNNING", "WAITING_ACCOUNT_LIST", "正在等待账号列表加载完成")
-    rows.first.wait_for(state="visible")
-    page.wait_for_timeout(2_000)
+    LOGGER.info("正在等待账号列表加载完成")
+    await rows.first.wait_for(state="visible")
+    await page.wait_for_timeout(2_000)
 
-    write_status(
-        "RUNNING",
-        "SEARCHING_STORE",
-        f"正在搜索店铺：{settings.store_name}",
-        store_name=settings.store_name,
-    )
-    search_box.fill(settings.store_name)
-    search_box.press("Enter")
+    LOGGER.info("正在搜索店铺：%s", settings.store_name)
+    await search_box.fill(settings.store_name)
+    await search_box.press("Enter")
 
-    expect(rows).to_have_count(1, timeout=settings.action_timeout)
+    await expect(rows).to_have_count(1, timeout=settings.action_timeout)
     row = rows.first
-    expect(row).to_contain_text(settings.store_name, timeout=settings.action_timeout)
+    await expect(row).to_contain_text(
+        settings.store_name,
+        timeout=settings.action_timeout,
+    )
     LOGGER.info("已找到唯一店铺搜索结果：%s", settings.store_name)
 
     baseline_process_ids = snapshot_process_ids()
 
-    write_status(
-        "RUNNING",
-        "STARTING_STORE",
-        f"正在启动店铺：{settings.store_name}",
-        store_name=settings.store_name,
-    )
+    LOGGER.info("正在启动店铺：%s", settings.store_name)
     start_button = row.locator(
         'div.restart.el-tooltip__trigger:has-text("启动")'
     )
-    expect(start_button).to_have_count(1, timeout=settings.action_timeout)
-    start_button.click()
+    await expect(start_button).to_have_count(1, timeout=settings.action_timeout)
+    await start_button.click()
 
-    page.locator("div.goBtn").wait_for(
+    await page.locator("div.goBtn").wait_for(
         state="visible",
         timeout=settings.action_timeout,
     )
@@ -516,7 +522,7 @@ def launch_store_browser_via_manager_center(
     return baseline_process_ids
 
 
-def configure_sycm_network_conditions(
+async def configure_sycm_network_conditions(
     cdp_session: CDPSession,
     chrome_version: str,
 ) -> None:
@@ -527,10 +533,10 @@ def configure_sycm_network_conditions(
         "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
         f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
     )
-    cdp_session.send("Network.enable")
-    cdp_session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+    await cdp_session.send("Network.enable")
+    await cdp_session.send("Network.setCacheDisabled", {"cacheDisabled": True})
     # Use browser default 没有独立开关；显式设置预设 UA 和 Client Hints 即启用覆盖。
-    cdp_session.send(
+    await cdp_session.send(
         "Network.setUserAgentOverride",
         {
             "userAgent": user_agent,
@@ -552,12 +558,145 @@ def configure_sycm_network_conditions(
     LOGGER.info("SYCM 页面网络条件已设置：禁用缓存，UA 预设=Chrome — Windows")
 
 
-def precheck_sycm_login(
+async def wait_for_stop_or_timeout(
+    stop_event: asyncio.Event,
+    timeout_seconds: float,
+) -> bool:
+    """等待观察流程停止，并返回是否在期限内收到停止信号。"""
+
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=timeout_seconds)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def watch_sycm_login_success(
+    page: Page,
+    stop_event: asyncio.Event,
+) -> LoginOutcome | None:
+    """观察 SYCM 顶层页面是否已经跳转到登录成功地址。"""
+
+    while not stop_event.is_set():
+        if page.url == SYCM_LOGIN_SUCCESS_URL:
+            await page.wait_for_load_state("domcontentloaded")
+            return LoginOutcome.SUCCESS
+        if await wait_for_stop_or_timeout(stop_event, POLL_INTERVAL_SECONDS):
+            break
+    return None
+
+
+async def watch_sycm_slider(
+    page: Page,
+    slider_button: Locator,
+    stop_event: asyncio.Event,
+) -> LoginOutcome | None:
+    """观察登录 iframe 中是否出现需要处理的滑块按钮。"""
+
+    while not stop_event.is_set():
+        try:
+            if await slider_button.is_visible():
+                return LoginOutcome.SLIDER_REQUIRED
+        except PlaywrightError:
+            if page.url == SYCM_LOGIN_SUCCESS_URL:
+                return LoginOutcome.SUCCESS
+            raise
+        if await wait_for_stop_or_timeout(stop_event, POLL_INTERVAL_SECONDS):
+            break
+    return None
+
+
+async def watch_sycm_retry_deadline(
+    stop_event: asyncio.Event,
+    timeout_ms: int,
+) -> LoginOutcome | None:
+    """在本次登录等待期限内没有其他结果时返回重试结果。"""
+
+    stopped = await wait_for_stop_or_timeout(stop_event, timeout_ms / 1000)
+    if stopped:
+        return None
+    return LoginOutcome.RETRY_REQUIRED
+
+
+def choose_login_outcome(
+    done: set[asyncio.Task[LoginOutcome | None]],
+) -> LoginOutcome:
+    """提取已完成任务的结果，并按成功、滑块、重试的顺序选择。"""
+
+    outcomes: set[LoginOutcome] = set()
+    first_error: Exception | None = None
+    for task in done:
+        try:
+            outcome = task.result()
+        except Exception as error:
+            first_error = first_error or error
+        else:
+            if outcome is not None:
+                outcomes.add(outcome)
+
+    for outcome in (
+        LoginOutcome.SUCCESS,
+        LoginOutcome.SLIDER_REQUIRED,
+        LoginOutcome.RETRY_REQUIRED,
+    ):
+        if outcome in outcomes:
+            return outcome
+    if first_error is not None:
+        raise first_error
+    raise RuntimeError("SYCM 登录观察任务没有返回有效结果")
+
+
+async def click_login_and_wait_for_outcome(
+    page: Page,
+    login_button: Locator,
+    slider_button: Locator,
+    timeout_ms: int,
+) -> LoginOutcome:
+    """点击登录，并等待成功、滑块或重试期限中的最先结果。"""
+
+    stop_event = asyncio.Event()
+    pending: set[asyncio.Task[LoginOutcome | None]] = {
+        asyncio.create_task(
+            watch_sycm_login_success(page, stop_event),
+            name="watch-sycm-login-success",
+        ),
+        asyncio.create_task(
+            watch_sycm_slider(page, slider_button, stop_event),
+            name="watch-sycm-slider",
+        ),
+    }
+
+    try:
+        await asyncio.sleep(0)
+        await login_button.click()
+        pending.add(
+            asyncio.create_task(
+                watch_sycm_retry_deadline(stop_event, timeout_ms),
+                name="watch-sycm-retry-deadline",
+            )
+        )
+        done, pending = await asyncio.wait(
+            pending,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        return choose_login_outcome(done)
+    finally:
+        stop_event.set()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def handle_sycm_slider(login_frame: FrameLocator) -> None:
+    """处理 SYCM 登录滑块；具体轨迹逻辑将在后续实现。"""
+
+    pass
+
+
+async def precheck_sycm_login(
     child_browser: Browser,
     settings: Settings,
     cdp_info: ChildBrowserCdpInfo,
 ) -> None:
-    """在子浏览器原有 Context 中尝试 SYCM 登录，暂不校验自动填充或处理滑块。"""
+    """等待 SYCM 账号密码自动填充后尝试登录，暂不处理滑块。"""
 
     if len(child_browser.contexts) != 1:
         raise RuntimeError(
@@ -569,157 +708,141 @@ def precheck_sycm_login(
     child_context.set_default_timeout(settings.action_timeout)
     child_context.set_default_navigation_timeout(settings.action_timeout)
 
-    write_status(
-        "RUNNING",
-        "OPENING_SYCM_LOGIN",
-        "正在通过子浏览器打开 SYCM 登录页",
-        store_name=settings.store_name,
-        child_pid=cdp_info.pid,
-        cdp_port=cdp_info.port,
+    LOGGER.info(
+        "正在通过子浏览器打开 SYCM 登录页：店铺=%s，PID=%d，port=%d",
+        settings.store_name,
+        cdp_info.pid,
+        cdp_info.port,
     )
-    page = child_context.new_page()
-    page.goto(
+    page = await child_context.new_page()
+    await page.goto(
         SYCM_LOGIN_URL,
         wait_until="domcontentloaded",
         timeout=settings.action_timeout,
     )
-    page.wait_for_timeout(SYCM_LOGIN_BUFFER_MS)
 
-    cdp_session = child_context.new_cdp_session(page)
-    try:
-        write_status(
-            "RUNNING",
-            "CONFIGURING_SYCM_NETWORK",
-            "正在设置 SYCM 页面网络条件",
-            store_name=settings.store_name,
-            child_pid=cdp_info.pid,
-        )
-        configure_sycm_network_conditions(cdp_session, child_browser.version)
-
-        write_status(
-            "RUNNING",
-            "LOGGING_IN_SYCM",
-            "正在点击登录并等待 SYCM 首页",
-            store_name=settings.store_name,
-            child_pid=cdp_info.pid,
-        )
-        login_frame = page.frame_locator("iframe#alibaba-login-box")
-        login_frame.get_by_role("button", name="登录", exact=True).click()
-        page.wait_for_url(
-            SYCM_LOGIN_SUCCESS_URL,
-            wait_until="domcontentloaded",
-            timeout=SYCM_LOGIN_TIMEOUT_MS,
-        )
-        LOGGER.info("SYCM 登录预检成功，当前页面：%s", page.url)
-    finally:
-        cdp_session.detach()
-
-    write_status(
-        "SUCCESS",
-        "SYCM_LOGIN_SUCCESS",
-        "店铺子浏览器已启动并完成 SYCM 登录预检",
-        store_name=settings.store_name,
-        child_pid=cdp_info.pid,
-        user_data_dir=str(cdp_info.user_data_dir),
-        cdp_port=cdp_info.port,
-        websocket_url=cdp_info.websocket_url,
-        page_url=page.url,
+    login_frame = page.frame_locator("iframe#alibaba-login-box")
+    password_input = login_frame.get_by_role(
+        "textbox",
+        name="请输入登录密码",
+        exact=True,
     )
+    login_button = login_frame.get_by_role("button", name="登录", exact=True)
+    slider_button = login_frame.get_by_role("button", name="滑块", exact=True)
+    LOGGER.info("正在等待 SYCM 账号密码自动填充：%s", settings.store_name)
+    await expect(password_input).not_to_have_value(
+        "",
+        timeout=settings.action_timeout,
+    )
+    LOGGER.info("SYCM 账号密码已自动填充：%s", settings.store_name)
+
+    cdp_session = await child_context.new_cdp_session(page)
+    try:
+        await configure_sycm_network_conditions(
+            cdp_session,
+            child_browser.version,
+        )
+
+        for attempt in range(1, 3):
+            LOGGER.info(
+                "正在点击登录并等待 SYCM 结果：店铺=%s，attempt=%d",
+                settings.store_name,
+                attempt,
+            )
+            outcome = await click_login_and_wait_for_outcome(
+                page,
+                login_button,
+                slider_button,
+                SYCM_LOGIN_TIMEOUT_MS,
+            )
+
+            match outcome:
+                case LoginOutcome.SUCCESS:
+                    LOGGER.info(
+                        "SYCM 登录预检成功：店铺=%s，PID=%d，当前页面=%s",
+                        settings.store_name,
+                        cdp_info.pid,
+                        page.url,
+                    )
+                    return
+                case LoginOutcome.SLIDER_REQUIRED:
+                    LOGGER.info("检测到 SYCM 登录滑块：%s", settings.store_name)
+                    await handle_sycm_slider(login_frame)
+                    raise NotImplementedError("SYCM 登录滑块处理尚未实现")
+                case LoginOutcome.RETRY_REQUIRED if attempt == 1:
+                    LOGGER.warning(
+                        "SYCM 登录点击后未出现结果，准备重试：%s",
+                        settings.store_name,
+                    )
+                case LoginOutcome.RETRY_REQUIRED:
+                    raise TimeoutError(
+                        "SYCM 登录重试后仍未跳转首页或出现滑块"
+                    )
+    finally:
+        await cdp_session.detach()
 
 
-def run_browser_flow(settings: Settings) -> None:
+async def run_browser_flow(settings: Settings) -> None:
     """串联管理中心启动、子进程发现、CDP 连接和 SYCM 登录预检流程。"""
 
-    with sync_playwright() as playwright:
-        manager_browser = playwright.chromium.connect_over_cdp(
+    async with async_playwright() as playwright:
+        LOGGER.info("正在连接挖象管理中心 CDP")
+        manager_browser = await playwright.chromium.connect_over_cdp(
             settings.manager_cdp_http_url,
             timeout=settings.action_timeout,
         )
         LOGGER.info("Playwright 已连接挖象管理中心 CDP")
 
-        baseline_process_ids = launch_store_browser_via_manager_center(
+        baseline_process_ids = await launch_store_browser_via_manager_center(
             manager_browser,
             settings,
         )
 
-        write_status(
-            "RUNNING",
-            "FINDING_CHILD_PROCESS",
-            "正在查找目标店铺的子浏览器进程",
-            store_name=settings.store_name,
-        )
-        child_process = wait_for_child_browser_process(
+        child_process = await wait_for_child_browser_process(
             store_name=settings.store_name,
             baseline_process_ids=baseline_process_ids,
             timeout_ms=settings.action_timeout,
         )
 
-        write_status(
-            "RUNNING",
-            "READING_CHILD_CDP",
-            "正在读取子浏览器 CDP 信息",
-            store_name=settings.store_name,
-            child_pid=child_process.pid,
-        )
-        child_cdp = wait_for_child_browser_cdp(
+        child_cdp = await wait_for_child_browser_cdp(
             child_process=child_process,
             timeout_ms=settings.action_timeout,
         )
 
-        write_status(
-            "RUNNING",
-            "CONNECTING_CHILD_CDP",
-            "正在连接子浏览器 CDP",
-            store_name=settings.store_name,
-            child_pid=child_cdp.pid,
-            cdp_port=child_cdp.port,
+        LOGGER.info(
+            "正在连接子浏览器 CDP：PID=%d，port=%d",
+            child_cdp.pid,
+            child_cdp.port,
         )
-        child_browser = playwright.chromium.connect_over_cdp(
+        child_browser = await playwright.chromium.connect_over_cdp(
             child_cdp.websocket_url,
             timeout=settings.action_timeout,
         )
         LOGGER.info("Playwright 已连接子浏览器 CDP：PID=%d", child_cdp.pid)
-        precheck_sycm_login(child_browser, settings, child_cdp)
+        await precheck_sycm_login(child_browser, settings, child_cdp)
 
         LOGGER.info("启动器流程执行完成；不会主动关闭管理中心或子浏览器")
 
 
-def main() -> int:
-    """执行启动器主流程，并将最终成功或失败状态返回给调用方。"""
+async def main() -> int:
+    """执行启动器主流程，并通过退出码向调用方返回成功或失败。"""
 
     try:
-        write_status("RUNNING", "LOADING_CONFIG", "正在加载配置")
+        LOGGER.info("挖象浏览器启动器开始执行")
         settings = load_settings()
-        LOGGER.info(
-            "配置加载完成：manager_link_path=%s，cdp_port=%d，"
-            "store_name=%s，action_timeout=%d",
-            settings.manager_link_path,
-            settings.cdp_port,
-            settings.store_name,
-            settings.action_timeout,
-        )
-
-        write_status("RUNNING", "STARTING_MANAGER", "正在启动挖象管理中心")
         shell_execute_manager(settings)
 
-        write_status("RUNNING", "CONNECTING_MANAGER_CDP", "正在等待管理中心 CDP")
-        wait_for_cdp_http(
+        await wait_for_cdp_http(
             settings.manager_cdp_http_url,
             settings.action_timeout,
             "挖象管理中心",
         )
-        run_browser_flow(settings)
+        await run_browser_flow(settings)
         return 0
-    except Exception as error:
+    except Exception:
         LOGGER.exception("启动器流程执行失败")
-        write_status(
-            "FAILED",
-            "ERROR",
-            str(error),
-            error_type=type(error).__name__,
-        )
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))
