@@ -22,6 +22,7 @@ from playwright.async_api import (
     Error as PlaywrightError,
     Locator,
     Page,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
     expect,
 )
@@ -40,6 +41,7 @@ SYCM_LOGIN_URL = (
 )
 SYCM_LOGIN_SUCCESS_URL = "https://sycm.taobao.com/portal/home.htm"
 SYCM_LOGIN_TIMEOUT_MS = 45_000
+PHONE_VERIFICATION_TIMEOUT_MS = 5_000
 POLL_INTERVAL_SECONDS = 1.0
 LOG_MAX_BYTES = 5_000 * 1024
 LOG_BACKUP_COUNT = 1
@@ -732,6 +734,19 @@ async def handle_sycm_slider(
     LOGGER.info("SYCM 滑块拖动已完成")
 
 
+async def wait_for_phone_verification(checkcode: Locator) -> bool:
+    """等待手机验证码输入框，并返回是否在 5 秒内出现。"""
+
+    try:
+        await checkcode.wait_for(
+            state="visible",
+            timeout=PHONE_VERIFICATION_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError:
+        return False
+    return True
+
+
 async def precheck_sycm_login(
     child_browser: Browser,
     settings: Settings,
@@ -769,8 +784,14 @@ async def precheck_sycm_login(
         exact=True,
     )
     login_button = login_frame.get_by_role("button", name="登录", exact=True)
-    slider_button = login_frame.get_by_role("button", name="滑块", exact=True)
-    sliding_region = login_frame.locator("span.nc-lang-cnt")
+    checkcode = login_frame.get_by_role(
+        "textbox",
+        name="6位数字",
+        exact=True,
+    )
+    slider_frame = login_frame.frame_locator("iframe#baxia-dialog-content")
+    slider_button = slider_frame.get_by_role("button", name="滑块", exact=True)
+    sliding_region = slider_frame.locator("span.nc-lang-cnt")
     LOGGER.info("正在等待 SYCM 账号密码自动填充：%s", settings.store_name)
     await expect(password_input).not_to_have_value(
         "",
@@ -820,6 +841,13 @@ async def precheck_sycm_login(
                         settings.store_name,
                     )
                     await login_button.click()
+                    if await wait_for_phone_verification(checkcode):
+                        LOGGER.warning(
+                            "检测到手机验证码输入框，启动器职责已完成，"
+                            "等待人工处理：%s",
+                            settings.store_name,
+                        )
+                        return
                     await page.wait_for_url(
                         SYCM_LOGIN_SUCCESS_URL,
                         wait_until="domcontentloaded",
