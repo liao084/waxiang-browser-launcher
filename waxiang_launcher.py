@@ -41,6 +41,8 @@ SYCM_LOGIN_URL = (
 )
 SYCM_LOGIN_SUCCESS_URL = "https://sycm.taobao.com/portal/home.htm"
 SYCM_LOGIN_TIMEOUT_MS = 45_000
+SLIDER_RESULT_TIMEOUT_MS = 5_000
+SLIDER_FAILURE_PROMPT_TIMEOUT_MS = 2_000
 PHONE_VERIFICATION_TIMEOUT_MS = 5_000
 POLL_INTERVAL_SECONDS = 1.0
 LOG_MAX_BYTES = 5_000 * 1024
@@ -102,6 +104,8 @@ class Settings:
     """保存从程序目录 .env 加载的启动配置。"""
 
     manager_link_path: Path
+    manager_account: str
+    manager_password: str
     cdp_port: int
     store_name: str
     action_timeout: int
@@ -180,6 +184,8 @@ def load_settings() -> Settings:
 
     settings = Settings(
         manager_link_path=Path(required_env("manager_link_path")),
+        manager_account=required_env("manager_account"),
+        manager_password=required_env("manager_password"),
         cdp_port=cdp_port,
         store_name=required_env("store_name"),
         action_timeout=action_timeout,
@@ -476,6 +482,69 @@ def get_only_page(browser: Browser) -> Page:
     return pages[0]
 
 
+async def ensure_waxiang_manager_logged_in(
+    page: Page,
+    settings: Settings,
+) -> None:
+    """确认挖象管理中心已经登录，并在未登录时进入登录流程。"""
+
+    account_button = page.get_by_role(
+        "button",
+        name="账号角色",
+        exact=False,
+    )
+    await expect(account_button).to_have_count(1)
+    await expect(account_button).to_be_visible()
+
+    logged_out_button = page.get_by_role(
+        "button",
+        name="账号角色： 未登录",
+        exact=True,
+    )
+    # account_button 可见时不一定是最终状态，给 2 秒缓冲时间充分渲染。
+    await page.wait_for_timeout(2_000)
+    if not await logged_out_button.is_visible():
+        LOGGER.info("挖象管理中心已经登录")
+        return
+
+    LOGGER.info("检测到挖象管理中心尚未登录")
+    await logged_out_button.click(timeout=settings.action_timeout)
+    waxiang_login_panel = page.locator("div.logincontent")
+    await expect(waxiang_login_panel).to_be_visible(
+        timeout=settings.action_timeout
+    )
+
+    # 三种登录方式中，第一个图片入口为账号密码登录。
+    account_password_login_image = waxiang_login_panel.get_by_role(
+        "image",
+        name="",
+        exact=True,
+    ).first
+    await account_password_login_image.click(timeout=settings.action_timeout)
+
+    account_input = waxiang_login_panel.get_by_role(
+        "textbox",
+        name="请输入手机号",
+        exact=True,
+    )
+    password_input = waxiang_login_panel.get_by_role(
+        "textbox",
+        name="请输入密码",
+        exact=True,
+    )
+    login_button = waxiang_login_panel.get_by_text("登录", exact=True)
+
+    LOGGER.info("正在填写挖象管理中心账号密码")
+    await account_input.fill(settings.manager_account)
+    await password_input.fill(settings.manager_password)
+    await login_button.click(timeout=settings.action_timeout)
+    await logged_out_button.wait_for(
+        state="hidden",
+        timeout=settings.action_timeout,
+    )
+    LOGGER.info("挖象管理中心登录成功")
+
+
 async def launch_store_browser_via_manager_center(
     browser: Browser,
     settings: Settings,
@@ -491,6 +560,9 @@ async def launch_store_browser_via_manager_center(
     account_menu = page.locator('div.menu_bar:has-text("账号")')
     await expect(account_menu).to_have_count(1, timeout=settings.action_timeout)
     await account_menu.click()
+
+    # 进行挖象管理中心账号登录校验
+    await ensure_waxiang_manager_logged_in(page, settings)
 
     search_box = page.get_by_role("textbox", name="搜索名称", exact=False)
     await search_box.wait_for(state="visible")
@@ -696,9 +768,10 @@ async def handle_sycm_slider(
     page: Page,
     slider_button: Locator,
     sliding_region: Locator,
+    slider_failure_prompt: Locator,
     timeout_ms: int,
-) -> None:
-    """读取 SYCM 滑块 CSS 尺寸，并使用拟人轨迹拖动到右侧。"""
+) -> bool:
+    """执行一次 SYCM 简单滑块拖动，并返回验证是否通过。"""
 
     await expect(slider_button).to_be_visible(timeout=timeout_ms)
     await expect(sliding_region).to_be_visible(timeout=timeout_ms)
@@ -731,7 +804,29 @@ async def handle_sycm_slider(
         start_y,
         trajectory,
     )
-    LOGGER.info("SYCM 滑块拖动已完成")
+    LOGGER.info("SYCM 滑块拖动动作已完成，正在等待滑块消失")
+    try:
+        await slider_button.wait_for(
+            state="hidden",
+            timeout=SLIDER_RESULT_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError:
+        LOGGER.warning("SYCM 滑块拖动后仍然可见，本次滑动未通过")
+        return False
+
+    try:
+        await slider_failure_prompt.wait_for(
+            state="visible",
+            timeout=SLIDER_FAILURE_PROMPT_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError:
+        pass
+    else:
+        LOGGER.warning("SYCM 滑块按钮已消失，但页面显示验证失败提示")
+        return False
+
+    LOGGER.info("SYCM 滑块已经消失，本次滑动通过")
+    return True
 
 
 async def wait_for_phone_verification(checkcode: Locator) -> bool:
@@ -792,6 +887,13 @@ async def precheck_sycm_login(
     slider_frame = login_frame.frame_locator("iframe#baxia-dialog-content")
     slider_button = slider_frame.get_by_role("button", name="滑块", exact=True)
     sliding_region = slider_frame.locator("span.nc-lang-cnt")
+    slider_retry_container = slider_frame.locator(
+        "div#nc_1_nocaptcha.nc_1_nocaptcha"
+    )
+    slider_failure_prompt = slider_retry_container.get_by_text(
+        "验证失败",
+        exact=False,
+    ).first
     LOGGER.info("正在等待 SYCM 账号密码自动填充：%s", settings.store_name)
     await expect(password_input).not_to_have_value(
         "",
@@ -830,14 +932,27 @@ async def precheck_sycm_login(
                     return
                 case LoginOutcome.SLIDER_REQUIRED:
                     LOGGER.info("检测到 SYCM 登录滑块：%s", settings.store_name)
-                    await handle_sycm_slider(
+                    slider_passed = await handle_sycm_slider(
                         page,
                         slider_button,
                         sliding_region,
+                        slider_failure_prompt,
                         settings.action_timeout,
                     )
+                    if not slider_passed:
+                        LOGGER.warning(
+                            "SYCM 滑块未通过，正在点击失败提示恢复滑块：%s",
+                            settings.store_name,
+                        )
+                        await slider_retry_container.click()
+                        LOGGER.info(
+                            "已点击 SYCM 滑块失败提示，交由下一轮自动等待：%s",
+                            settings.store_name,
+                        )
+                        continue
+
                     LOGGER.info(
-                        "SYCM 滑块拖动完成，正在重新点击登录：%s",
+                        "SYCM 滑块已经通过，正在重新点击登录：%s",
                         settings.store_name,
                     )
                     await login_button.click()
@@ -870,6 +985,7 @@ async def precheck_sycm_login(
                     raise TimeoutError(
                         "SYCM 登录重试后仍未跳转首页或出现滑块"
                     )
+        raise TimeoutError("SYCM 登录尝试次数耗尽，简单滑块仍未通过")
     finally:
         await cdp_session.detach()
 

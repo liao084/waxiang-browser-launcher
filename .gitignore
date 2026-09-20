@@ -11,6 +11,8 @@ browser_launcher.log*
 
 # 本地测试文件
 test_waxiang.py
+show_trajectory.py
+trajectory_preview.html
 
 # PyInstaller 和本地打包产物
 build/
