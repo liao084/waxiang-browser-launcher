@@ -493,8 +493,7 @@ async def ensure_waxiang_manager_logged_in(
         name="账号角色",
         exact=False,
     )
-    await expect(account_button).to_have_count(1)
-    await expect(account_button).to_be_visible()
+    await expect(account_button).to_be_visible(timeout=settings.action_timeout)
 
     logged_out_button = page.get_by_role(
         "button",
@@ -515,10 +514,8 @@ async def ensure_waxiang_manager_logged_in(
     )
 
     # 三种登录方式中，第一个图片入口为账号密码登录。
-    account_password_login_image = waxiang_login_panel.get_by_role(
-        "image",
-        name="",
-        exact=True,
+    account_password_login_image = waxiang_login_panel.locator(
+        "img:visible"
     ).first
     await account_password_login_image.click(timeout=settings.action_timeout)
 
